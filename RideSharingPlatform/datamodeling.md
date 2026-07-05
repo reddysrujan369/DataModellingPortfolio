@@ -108,15 +108,23 @@ This data model supports a ride-hailing application (Uber-style) covering the co
 | effective_end_date | DATE | Yes | NULL = current |
 | is_current | BOOLEAN | No | |
 
-### 3.4 Driver_Session
-| Column | Data Type | Nullable | Key |
+#### Fact_Driver_Session (Factless Fact)
+**Grain: one row = one driver online session** (login to logout). This is a 
+factless fact table — the core event is "a driver was online during this 
+period," not a business measure like revenue. `session_duration_min` is 
+stored as a convenience derived column (a common practical exception to 
+pure factless design) rather than a true additive measure.
+
+| Column | Data Type | Type | Notes |
 |---|---|---|---|
-| session_id | BIGINT | No | PK |
-| driver_id | INT | No | FK → Driver |
-| login_time | TIMESTAMP | No | |
-| logout_time | TIMESTAMP | Yes | NULL = still online |
-| city | VARCHAR(50) | No | |
-| geo_id | INT | Yes | FK → Geo_Location |
+| session_key | BIGINT | PK (surrogate) | |
+| session_id | BIGINT | Degenerate dim | natural key |
+| driver_key | INT | FK → Dim_Driver | |
+| login_datetime_key | BIGINT | FK → Dim_Date | derived from login_time (role-playing) |
+| logout_datetime_key | BIGINT | FK → Dim_Date | nullable — NULL if still online (role-playing) |
+| geo_key | INT | FK → Dim_Geo_Location | nullable, login location |
+| session_duration_min | INT | Measure (derived) | logout_time − login_time in minutes |
+| is_active_session | BOOLEAN | Measure (flag) | TRUE if logout_time is NULL |
 
 ### 3.5 Vehicle
 | Column | Data Type | Nullable | Key |
