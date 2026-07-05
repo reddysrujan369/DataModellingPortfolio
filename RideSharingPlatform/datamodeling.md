@@ -430,4 +430,3 @@ This data model supports a ride-hailing application (Uber-style) covering the co
 
 ---
 
-*Document version: Draft — covers business requirements through star schema physical model. KPI and AI/ML sections to follow in a subsequent phase.*
