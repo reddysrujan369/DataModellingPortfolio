@@ -6,7 +6,7 @@
 This data model supports a ride-hailing application (Uber-style) covering the core entities: riders, drivers, vehicles, rides, payments, ratings, and geo-locations. The model is designed to support KPI reporting, AI/ML use cases, and business optimization analysis.
 
 ### 1.2 Key Business Requirements
-- **Driver onboarding lifecycle**: Track signup, background check, document check, and activation dates — including re-verification cycles when a driver goes inactive and is later reactivated.
+- **Driver onboarding lifecycle**: Track signup, background check, document check, and activation dates — including re-verification cycles when a driver goes inactive and is later reactivated. Also measure **how long each stage takes** (e.g., signup-to-activation time) as a funnel-speed KPI.
 - **Vehicle compliance lifecycle**: Track insurance, pollution certificate (PUC), registration (RC), and fitness certificate validity over time.
 - **Third-party / fleet vehicles**: Support vehicles not owned by the driver directly (fleet companies, rental partners), and drivers who may use different vehicles over time.
 - **Cancellations**: Track ride cancellations by both rider and driver, with reasons and timing.
@@ -20,19 +20,21 @@ This data model supports a ride-hailing application (Uber-style) covering the co
   - Average trip duration
   - Rider retention rate
   - Surge pricing patterns
+  - Driver onboarding funnel speed (signup → activation, and each intermediate stage)
 
 ### 1.3 Modeling Approach Decisions
 | Decision | Choice | Rationale |
 |---|---|---|
 | Normalization for source entities | Light-touch (no formal 3NF proof) | Project is OLAP/analytics-focused, not a live OLTP system |
 | Warehouse modeling style | Kimball star schema | Optimized for BI queries and KPI reporting |
-| Fact table strategy | Multiple fact tables (Fact_Ride, Fact_Payment, Fact_Rating) | Loose coupling, clean grain per business process |
+| Fact table strategy | Multiple fact tables (Fact_Ride, Fact_Payment, Fact_Rating, Fact_Driver_Session, Fact_Driver_Onboarding) | Loose coupling, clean grain per business process |
 | Cancellation modeling | Merged into Fact_Ride (not a separate fact) | Same grain as Ride (0 or 1 cancellation per ride) |
 | Date/Time dimension | Single merged Dim_Date (hourly grain) | Simpler joins; hourly granularity sufficient for all stated KPIs |
-| Driver onboarding history | SCD Type 2, single combined table | Tracks full history of bg check / doc check / activation together |
-| Vehicle compliance history | SCD Type 2 | Tracks insurance/PUC/RC/fitness validity over time |
+| Driver onboarding history | **Accumulating Snapshot Fact** (revised from SCD2) | Onboarding is a linear pipeline with fixed milestones (signup → bg check → doc check → activation); an accumulating snapshot lets the row be updated in place as milestones complete and stores stage-to-stage duration directly as measures — which SCD2 could not answer cleanly (SCD2 tracks state history, not elapsed time between stages) |
+| Vehicle compliance history | SCD Type 2 | Tracks insurance/PUC/RC/fitness validity over time (this remains SCD2 — it's a status-over-time question, not a pipeline-duration question) |
 | Vehicle ownership | Separate Vehicle_Owner entity + Driver_Vehicle_Mapping | Supports fleet/third-party vehicles and drivers using multiple vehicles over time |
 | Cancellation reason | Free text (not a lookup table) | Kept simple per project scope |
+| Driver online sessions | Factless Fact (Fact_Driver_Session) | Records that a driver was online; no inherent business measure, supports utilization KPI |
 
 ---
 
@@ -40,8 +42,8 @@ This data model supports a ride-hailing application (Uber-style) covering the co
 
 1. **Rider** — the customer requesting rides
 2. **Driver** — the person driving
-3. **Driver_Onboarding_History** — SCD2 history of driver verification lifecycle
-4. **Driver_Session** — driver online/offline sessions (needed for utilization KPIs)
+3. **Driver_Onboarding_History** — pipeline tracking of driver verification lifecycle (signup, bg check, doc check, activation); becomes an **accumulating snapshot fact** in the star schema
+4. **Driver_Session** — driver online/offline sessions (needed for utilization KPIs); becomes a **factless fact** in the star schema
 5. **Vehicle** — the car used for rides
 6. **Vehicle_Owner** — owner of the vehicle (self, fleet company, rental partner)
 7. **Driver_Vehicle_Mapping** — many-to-many relationship between drivers and vehicles over time
@@ -54,7 +56,7 @@ This data model supports a ride-hailing application (Uber-style) covering the co
 ### 2.1 Relationship Summary
 - Rider (1) → (M) Ride
 - Driver (1) → (M) Ride
-- Driver (1) → (M) Driver_Onboarding_History
+- Driver (1) → (M) Driver_Onboarding_History *(one row per onboarding cycle)*
 - Driver (1) → (M) Driver_Session
 - Driver (M) ↔ (M) Vehicle *(via Driver_Vehicle_Mapping)*
 - Vehicle_Owner (1) → (M) Vehicle
@@ -92,21 +94,26 @@ This data model supports a ride-hailing application (Uber-style) covering the co
 | city | VARCHAR(50) | No | |
 | current_status | VARCHAR(20) | No | active/inactive/suspended |
 
-### 3.3 Driver_Onboarding_History (SCD2)
+### 3.3 Driver_Onboarding_History (revised — pipeline/cycle tracking)
+**One row per onboarding cycle** (a driver who deactivates and later re-applies gets a new row, not a new version of the old row).
+
 | Column | Data Type | Nullable | Key |
 |---|---|---|---|
-| onboarding_sk | BIGINT | No | PK (surrogate) |
+| onboarding_id | BIGINT | No | PK (surrogate) |
 | driver_id | INT | No | FK → Driver |
+| cycle_number | INT | No | 1st application, 2nd, 3rd... |
+| signup_date | DATE | No | milestone 1 — was missing before, now explicit |
 | bg_check_status | VARCHAR(20) | Yes | |
-| bg_check_date | DATE | Yes | |
+| bg_check_date | DATE | Yes | milestone 2, nullable until completed |
 | doc_check_status | VARCHAR(20) | Yes | |
-| doc_check_date | DATE | Yes | |
+| doc_check_date | DATE | Yes | milestone 3, nullable until completed |
 | activation_status | VARCHAR(20) | Yes | |
-| activation_date | DATE | Yes | |
+| activation_date | DATE | Yes | milestone 4, nullable until completed |
+| deactivation_date | DATE | Yes | end of cycle, nullable |
 | deactivation_reason | VARCHAR(200) | Yes | |
-| effective_start_date | DATE | No | |
-| effective_end_date | DATE | Yes | NULL = current |
-| is_current | BOOLEAN | No | |
+| is_current_cycle | BOOLEAN | No | most recent cycle for this driver |
+
+*Note: duration/lag values (days between milestones) are **not stored here** at the source level — they get calculated and stored downstream in the warehouse fact table (see Section 4.2), which is standard practice: keep the source system simple, let the ETL layer derive analytical measures.*
 
 ### 3.4 Driver_Session
 | Column | Data Type | Nullable | Key |
@@ -232,9 +239,10 @@ This data model supports a ride-hailing application (Uber-style) covering the co
 ### 4.1 Design Principles
 - Grain is explicitly defined for every fact table to prevent fan-out errors.
 - All dimension keys are surrogate keys (INT/BIGINT), decoupled from source system natural keys.
-- SCD Type 2 dimensions (`Dim_Driver_Onboarding`, `Dim_Vehicle_Compliance`) carry `is_current` for easy latest-state filtering.
+- SCD Type 2 dimensions (`Dim_Vehicle_Compliance`) carry `is_current` for easy latest-state filtering.
 - Fact tables contain measures and foreign keys only — no descriptive attributes.
 - Date and time are combined into a single `Dim_Date` table at **hourly grain** (one row per hour per day) rather than separate Date/Time dimensions, to simplify joins while retaining time-of-day analysis capability.
+- **Driver onboarding is modeled as an Accumulating Snapshot Fact, not an SCD2 dimension** — see Section 4.2 for the reasoning.
 
 ### 4.2 Fact Tables
 
@@ -295,6 +303,34 @@ This data model supports a ride-hailing application (Uber-style) covering the co
 
 This fact table directly supports the **driver utilization rate KPI** (online time vs. time actually spent on completed rides), which could not be computed from Fact_Ride alone since Fact_Ride has no visibility into idle/available time.
 
+#### Fact_Driver_Onboarding (Accumulating Snapshot Fact) — REVISED
+**Grain: one row per driver onboarding cycle** (a driver who deactivates and re-applies gets a **new row**, not a new version of the old one).
+
+**Why accumulating snapshot, and not SCD2 (the earlier design):** Onboarding is a linear pipeline with a defined start (signup) and end (activation), moving through fixed, ordered milestones. The row is **created at signup and updated in place** as each milestone completes — that update-in-place behavior, plus the need to measure elapsed time *between* milestones, is the exact textbook signature of an accumulating snapshot. SCD2 answers "what did this driver's status look like on date X" (a state-history question); it does not cleanly give you "how many days did activation take," because that requires computing lag between rows/attributes rather than just describing a state. Since re-application after deactivation is a genuinely new instance of the process, it correctly becomes a new row (new cycle) rather than another SCD2 version of the same row.
+
+| Column | Data Type | Type | Notes |
+|---|---|---|---|
+| onboarding_key | BIGINT | PK (surrogate) | |
+| driver_key | INT | FK → Dim_Driver | |
+| cycle_number | INT | Degenerate dim | 1st application, 2nd, 3rd... |
+| signup_date_key | BIGINT | FK → Dim_Date | milestone 1 (role-playing) |
+| bg_check_date_key | BIGINT | FK → Dim_Date | milestone 2, nullable (role-playing) |
+| doc_check_date_key | BIGINT | FK → Dim_Date | milestone 3, nullable (role-playing) |
+| activation_date_key | BIGINT | FK → Dim_Date | milestone 4, nullable (role-playing) |
+| deactivation_date_key | BIGINT | FK → Dim_Date | end of cycle, nullable (role-playing) |
+| bg_check_status | VARCHAR(20) | Degenerate dim | |
+| doc_check_status | VARCHAR(20) | Degenerate dim | |
+| activation_status | VARCHAR(20) | Degenerate dim | |
+| deactivation_reason | VARCHAR(200) | Degenerate dim | nullable |
+| days_signup_to_bgcheck | INT | Measure (lag) | nullable until bg check done |
+| days_bgcheck_to_doccheck | INT | Measure (lag) | nullable until doc check done |
+| days_doccheck_to_activation | INT | Measure (lag) | nullable until activated |
+| days_signup_to_activation | INT | Measure (lag, total) | the core onboarding-speed KPI |
+| is_current_cycle | BOOLEAN | Flag | most recent cycle for this driver |
+| is_currently_active | BOOLEAN | Flag | did this cycle end in an active driver |
+
+This table directly answers KPIs like *"average days from signup to activation, by month"* and *"where in the funnel do most drop-offs happen"* (e.g., high `bg_check_status = failed` counts vs. `doc_check_status = failed`) — without any date-math needed at query time.
+
 #### Fact_Rating
 **Grain: one row = one rating event** (rider→driver OR driver→rider).
 
@@ -342,21 +378,7 @@ This fact table directly supports the **driver utilization rate KPI** (online ti
 | city | VARCHAR(50) | |
 | current_status | VARCHAR(20) | |
 
-#### Dim_Driver_Onboarding (SCD2)
-| Column | Type | Notes |
-|---|---|---|
-| onboarding_key (PK) | BIGINT | surrogate |
-| driver_key | INT | FK → Dim_Driver |
-| bg_check_status | VARCHAR(20) | |
-| bg_check_date | DATE | |
-| doc_check_status | VARCHAR(20) | |
-| doc_check_date | DATE | |
-| activation_status | VARCHAR(20) | |
-| activation_date | DATE | |
-| deactivation_reason | VARCHAR(200) | |
-| effective_start_date | DATE | |
-| effective_end_date | DATE | nullable |
-| is_current | BOOLEAN | |
+*Note: `Dim_Driver_Onboarding` (SCD2) has been removed from the dimension list — onboarding is now modeled as `Fact_Driver_Onboarding`, an accumulating snapshot fact (see Section 4.2). `Dim_Driver.current_status` remains sufficient for simple "is this driver currently active" filtering elsewhere in the model.*
 
 #### Dim_Vehicle
 | Column | Type | Notes |
@@ -429,12 +451,14 @@ This fact table directly supports the **driver utilization rate KPI** (online ti
 | is_peak_hour | BOOLEAN | |
 | shift_period | VARCHAR(20) | Morning/Afternoon/Evening/Night |
 
+*Note: for `Fact_Driver_Onboarding`, since milestones are dates (not specific hours), only the `full_date` portion of `Dim_Date` is meaningfully used — the hourly grain simply isn't needed for that fact, which is fine; unused grain resolution on a shared conformed dimension is normal and expected.*
+
 ### 4.4 Star Schema Relationship Summary
 - Fact_Ride → Dim_Rider, Dim_Driver, Dim_Vehicle, Dim_Geo_Location (pickup + drop), Dim_Date
 - Fact_Payment → Dim_Rider, Dim_Driver, Dim_Date
-- Fact_Rating → Dim_Rider/Dim_Driver (rater, ratee — pending Dim_Person decision), Dim_Date
 - Fact_Driver_Session → Dim_Driver, Dim_Date (login + logout, role-playing), Dim_Geo_Location
-- Dim_Driver → Dim_Driver_Onboarding (1:M, SCD2)
+- Fact_Driver_Onboarding → Dim_Driver, Dim_Date (signup/bg_check/doc_check/activation/deactivation — five role-playing references to the same conformed Dim_Date)
+- Fact_Rating → Dim_Rider/Dim_Driver (rater, ratee — pending Dim_Person decision), Dim_Date
 - Dim_Vehicle → Dim_Vehicle_Compliance (1:M, SCD2)
 - Dim_Vehicle → Dim_Vehicle_Owner (M:1)
 
@@ -444,20 +468,21 @@ For learning purposes, here's how standard Kimball concepts map onto this model:
 | Concept | Used? | Where / Why |
 |---|---|---|
 | Transaction fact | Yes | Fact_Ride, Fact_Payment, Fact_Rating — discrete one-time events |
-| Accumulating snapshot fact | No (SCD2 used instead) | Considered for Driver_Onboarding, but SCD2 fits better since a driver can cycle through the process multiple times (active → inactive → reactivated), breaking the "one row per instance" assumption accumulating snapshots depend on |
+| Accumulating snapshot fact | **Yes (revised)** | Fact_Driver_Onboarding — linear pipeline (signup → bg check → doc check → activation) with a row updated in place as milestones complete, and stage-to-stage duration stored as measures |
 | Periodic snapshot fact | Not yet | Would add later for BI dashboard performance at scale (e.g. daily driver summary), not needed since current KPIs can be aggregated from transaction facts directly |
 | Factless fact | Yes | Fact_Driver_Session — records that a driver was online, not a business measure |
 | Conformed dimension | Yes | Dim_Rider, Dim_Driver, Dim_Date — shared identically across multiple fact tables |
-| Role-playing dimension | Yes | Dim_Geo_Location (pickup/drop on Fact_Ride), Dim_Date (login/logout on Fact_Driver_Session); Fact_Rating's rater/ratee is a messier polymorphic variant, pending Dim_Person resolution |
+| Role-playing dimension | Yes | Dim_Geo_Location (pickup/drop on Fact_Ride); Dim_Date (login/logout on Fact_Driver_Session; signup/bg_check/doc_check/activation/deactivation on Fact_Driver_Onboarding); Fact_Rating's rater/ratee is a messier polymorphic variant, pending Dim_Person resolution |
 
 ---
 
 ## 5. Open Items Carried Forward
 1. **Dim_Person decision**: whether to unify Dim_Rider and Dim_Driver into a single Dim_Person for clean handling of Fact_Rating's polymorphic rater/ratee roles (recommended, pending final confirmation).
-2. **KPI SQL definitions**: to be built in a later phase (monthly driver revenue, cancellation rate, gender-bias rating analysis, driver utilization, average trip duration, rider retention).
+2. **KPI SQL definitions**: to be built in a later phase (monthly driver revenue ✅ done, cancellation rate, gender-bias rating analysis, driver utilization, average trip duration, rider retention, onboarding funnel speed).
 3. **AI/ML use case data prep**: to be scoped separately (e.g., ETA prediction, surge prediction, fraud detection, churn prediction, demand forecasting).
 
 ---
+
 
 
 
