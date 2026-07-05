@@ -108,23 +108,15 @@ This data model supports a ride-hailing application (Uber-style) covering the co
 | effective_end_date | DATE | Yes | NULL = current |
 | is_current | BOOLEAN | No | |
 
-#### Fact_Driver_Session (Factless Fact)
-**Grain: one row = one driver online session** (login to logout). This is a 
-factless fact table — the core event is "a driver was online during this 
-period," not a business measure like revenue. `session_duration_min` is 
-stored as a convenience derived column (a common practical exception to 
-pure factless design) rather than a true additive measure.
-
-| Column | Data Type | Type | Notes |
+### 3.4 Driver_Session
+| Column | Data Type | Nullable | Key |
 |---|---|---|---|
-| session_key | BIGINT | PK (surrogate) | |
-| session_id | BIGINT | Degenerate dim | natural key |
-| driver_key | INT | FK → Dim_Driver | |
-| login_datetime_key | BIGINT | FK → Dim_Date | derived from login_time (role-playing) |
-| logout_datetime_key | BIGINT | FK → Dim_Date | nullable — NULL if still online (role-playing) |
-| geo_key | INT | FK → Dim_Geo_Location | nullable, login location |
-| session_duration_min | INT | Measure (derived) | logout_time − login_time in minutes |
-| is_active_session | BOOLEAN | Measure (flag) | TRUE if logout_time is NULL |
+| session_id | BIGINT | No | PK |
+| driver_id | INT | No | FK → Driver |
+| login_time | TIMESTAMP | No | |
+| logout_time | TIMESTAMP | Yes | NULL = still online |
+| city | VARCHAR(50) | No | |
+| geo_id | INT | Yes | FK → Geo_Location |
 
 ### 3.5 Vehicle
 | Column | Data Type | Nullable | Key |
@@ -287,6 +279,22 @@ pure factless design) rather than a true additive measure.
 | driver_earning | DECIMAL(10,2) | Measure | |
 | platform_commission | DECIMAL(10,2) | Measure | |
 
+#### Fact_Driver_Session (Factless Fact)
+**Grain: one row = one driver online session** (login to logout). This is a factless fact table — the core event is "a driver was online during this period," not a business measure like revenue. `session_duration_min` is stored as a convenience derived column (a common practical exception to pure factless design) rather than a true additive measure.
+
+| Column | Data Type | Type | Notes |
+|---|---|---|---|
+| session_key | BIGINT | PK (surrogate) | |
+| session_id | BIGINT | Degenerate dim | natural key |
+| driver_key | INT | FK → Dim_Driver | |
+| login_datetime_key | BIGINT | FK → Dim_Date | derived from login_time (role-playing) |
+| logout_datetime_key | BIGINT | FK → Dim_Date | nullable — NULL if still online (role-playing) |
+| geo_key | INT | FK → Dim_Geo_Location | nullable, login location |
+| session_duration_min | INT | Measure (derived) | logout_time − login_time in minutes |
+| is_active_session | BOOLEAN | Measure (flag) | TRUE if logout_time is NULL |
+
+This fact table directly supports the **driver utilization rate KPI** (online time vs. time actually spent on completed rides), which could not be computed from Fact_Ride alone since Fact_Ride has no visibility into idle/available time.
+
 #### Fact_Rating
 **Grain: one row = one rating event** (rider→driver OR driver→rider).
 
@@ -425,9 +433,22 @@ pure factless design) rather than a true additive measure.
 - Fact_Ride → Dim_Rider, Dim_Driver, Dim_Vehicle, Dim_Geo_Location (pickup + drop), Dim_Date
 - Fact_Payment → Dim_Rider, Dim_Driver, Dim_Date
 - Fact_Rating → Dim_Rider/Dim_Driver (rater, ratee — pending Dim_Person decision), Dim_Date
+- Fact_Driver_Session → Dim_Driver, Dim_Date (login + logout, role-playing), Dim_Geo_Location
 - Dim_Driver → Dim_Driver_Onboarding (1:M, SCD2)
 - Dim_Vehicle → Dim_Vehicle_Compliance (1:M, SCD2)
 - Dim_Vehicle → Dim_Vehicle_Owner (M:1)
+
+### 4.5 Kimball Fact/Dimension Pattern Reference
+For learning purposes, here's how standard Kimball concepts map onto this model:
+
+| Concept | Used? | Where / Why |
+|---|---|---|
+| Transaction fact | Yes | Fact_Ride, Fact_Payment, Fact_Rating — discrete one-time events |
+| Accumulating snapshot fact | No (SCD2 used instead) | Considered for Driver_Onboarding, but SCD2 fits better since a driver can cycle through the process multiple times (active → inactive → reactivated), breaking the "one row per instance" assumption accumulating snapshots depend on |
+| Periodic snapshot fact | Not yet | Would add later for BI dashboard performance at scale (e.g. daily driver summary), not needed since current KPIs can be aggregated from transaction facts directly |
+| Factless fact | Yes | Fact_Driver_Session — records that a driver was online, not a business measure |
+| Conformed dimension | Yes | Dim_Rider, Dim_Driver, Dim_Date — shared identically across multiple fact tables |
+| Role-playing dimension | Yes | Dim_Geo_Location (pickup/drop on Fact_Ride), Dim_Date (login/logout on Fact_Driver_Session); Fact_Rating's rater/ratee is a messier polymorphic variant, pending Dim_Person resolution |
 
 ---
 
@@ -437,4 +458,6 @@ pure factless design) rather than a true additive measure.
 3. **AI/ML use case data prep**: to be scoped separately (e.g., ETA prediction, surge prediction, fraud detection, churn prediction, demand forecasting).
 
 ---
+
+
 
